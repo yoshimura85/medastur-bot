@@ -229,10 +229,7 @@ class MedasturScraper:
 
     def search_slots(self, filters: dict) -> list[Slot]:
         """
-        filters keys:
-          compania, especialidad, medico,
-          centro (default 30061), provincia (default 0033),
-          localidad (default '0447   '),
+        filters keys: compania, especialidad,
           fecha_desde (dd/MM/yyyy, default today),
           hora_desde (default 08:00), hora_hasta (default 20:30)
         """
@@ -241,10 +238,6 @@ class MedasturScraper:
 
         compania     = filters.get("compania", "")
         especialidad = filters.get("especialidad", "")
-        medico       = filters.get("medico", "")
-        centro       = filters.get("centro", "30061")
-        provincia    = filters.get("provincia", "0033")
-        localidad    = filters.get("localidad", "0447   ")
         fecha        = filters.get("fecha_desde", date.today().strftime("%d/%m/%Y"))
         hora_desde   = filters.get("hora_desde", "08:00")
         hora_hasta   = filters.get("hora_hasta", "20:30")
@@ -254,51 +247,60 @@ class MedasturScraper:
         if soup is None:
             return []
 
-        # Step 2: cascade compania → reloads especialidades
+        # Step 2: PostBack compania → reloads centros + especialidades
         if compania:
             fields["ddlCompania"] = compania
             soup, fields = self._postback("ddlCompania", fields)
             if soup is None:
                 return []
+            logger.info("After ddlCompania: centro=%r provincia=%r localidad=%r",
+                        fields.get("ddlCentro"), fields.get("ddlProvincia"),
+                        fields.get("ddlLocalidad"))
 
-        # Step 3: cascade especialidad → reloads ddlMedico
+        # Step 3: PostBack especialidad → reloads ddlMedico
         if especialidad:
             fields["ddlEspecialidad"] = especialidad
             soup, fields = self._postback("ddlEspecialidad", fields)
             if soup is None:
                 return []
-            # Pick "CUALQUIER MÉDICO" from the reloaded ddlMedico dropdown
-            if not medico and soup:
-                medico_sel = soup.find("select", {"name": "ddlMedico"})
-                if medico_sel:
-                    cualquier = next(
-                        (o for o in medico_sel.find_all("option")
-                         if "cualquier" in o.get_text(strip=True).lower()),
-                        None,
-                    )
-                    if cualquier:
-                        medico = cualquier.get("value", "")
-                        logger.info("ddlMedico → CUALQUIER MÉDICO (%r)", medico)
 
-        # Step 4: final search POST
-        fields.update({
-            "ddlCompania":           compania,
-            "ddlEspecialidad":       especialidad,
-            "ddlMedico":             medico,
-            "ddlCentro":             centro,
-            "ddlProvincia":          provincia,
-            "ddlLocalidad":          localidad,
-            "nuevaCita_Fecha":       fecha,
-            "horapreferente":        hora_desde,
-            "horapreferentehasta":   hora_hasta,
-            "ddlAtencion":           fields.get("ddlAtencion", ""),
-            "ddlLanguages":          "es",
-            "nuevaCita_id":          "",
-            "__EVENTTARGET":         "",
-            "__EVENTARGUMENT":       "",
-            "__LASTFOCUS":           "",
-            "btnBuscarCitasLibres":  "Buscar citas libres",
-        })
+        # Step 4: PostBack ddlMedico → select "CUALQUIER MÉDICO"
+        medico = ""
+        if soup:
+            medico_sel = soup.find("select", {"name": "ddlMedico"})
+            if medico_sel:
+                opts = medico_sel.find_all("option")
+                logger.info("ddlMedico options: %r",
+                            [(o.get("value",""), o.get_text(strip=True)) for o in opts[:8]])
+                cualquier = next(
+                    (o for o in opts if "cualquier" in o.get_text(strip=True).lower()),
+                    opts[0] if opts else None,
+                )
+                if cualquier:
+                    medico = cualquier.get("value", "")
+                    logger.info("ddlMedico → %r (%r)", cualquier.get_text(strip=True), medico)
+
+        if medico:
+            fields["ddlMedico"] = medico
+            soup, fields = self._postback("ddlMedico", fields)
+            if soup is None:
+                return []
+
+        # Step 5: final search POST — use form values from PostBacks, only override date/time
+        fields["ddlCompania"]         = compania
+        fields["ddlEspecialidad"]     = especialidad
+        fields["ddlMedico"]           = medico
+        fields["nuevaCita_Fecha"]     = fecha
+        fields["horapreferente"]      = hora_desde
+        fields["horapreferentehasta"] = hora_hasta
+        fields["ddlLanguages"]        = "es"
+        fields["nuevaCita_id"]        = ""
+        fields["__EVENTTARGET"]       = ""
+        fields["__EVENTARGUMENT"]     = ""
+        fields["__LASTFOCUS"]         = ""
+        fields["btnBuscarCitasLibres"] = "Buscar citas libres"
+        logger.info("Search POST fields subset: compania=%r esp=%r medico=%r centro=%r",
+                    compania, especialidad, medico, fields.get("ddlCentro"))
 
         try:
             resp = self.session.post(AUTO_URL, data=fields, timeout=30)
@@ -307,6 +309,7 @@ class MedasturScraper:
             logger.error("Search POST error: %s", e)
             return []
 
+        logger.info("Search response snippet: %s", resp.text[500:1200].replace("\n", " "))
         slots = self._parse_results(resp.text)
         logger.info("Found %d slots", len(slots))
         return slots
