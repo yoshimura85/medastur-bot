@@ -53,27 +53,28 @@ ESPECIALIDADES = {
     "14  ": "CIRUGIA PLASTICA Y REPARADORA",
     "07  ": "CIRUGIA VASCULAR",
     "16  ": "DERMATOLOGIA",
-    "4306": "DIETETICA Y NUTRICION",
+    "4306": "DIETÉTICA Y NUTRICIÓN",
     "08  ": "DIGESTIVO",
     "21  ": "HEMATOLOGIA Y HEMOTERAPIA",
-    "4307": "LOGOPEDIA",
+    "4305": "LOGOPEDIA",
     "01  ": "MEDICINA GENERAL",
-    "02  ": "MEDICINA INTERNA",
-    "23  ": "NEFROLOGIA",
-    "24  ": "NEUMOLOGIA",
-    "25  ": "NEUROCIRUGIA",
-    "26  ": "NEUROLOGIA",
-    "27  ": "OBSTETRICIA Y GINECOLOGIA",
-    "28  ": "OFTALMOLOGIA",
-    "29  ": "ONCOLOGIA MEDICA",
-    "30  ": "OTORRINOLARINGOLOGIA",
-    "4308": "PEDIATRIA",
-    "31  ": "PSIQUIATRIA",
-    "4309": "PSICOLOGIA",
-    "32  ": "REUMATOLOGIA",
-    "33  ": "TRAUMATOLOGIA Y CIRUGIA ORTOPEDICA",
-    "34  ": "UROLOGIA",
-    "4310": "FISIOTERAPIA",
+    "24  ": "MEDICINA INTERNA",
+    "26  ": "NEFROLOGIA",
+    "27  ": "NEUMOLOGIA",
+    "28  ": "NEUROCIRUGIA",
+    "30  ": "NEUROLOGIA",
+    "31  ": "OBSTETRICIA Y GINECOLOGIA",
+    "32  ": "OFTALMOLOGIA",
+    "33  ": "ONCOLOGIA MEDICA",
+    "34  ": "ONCOLOGIA RADIOTERAPICA",
+    "35  ": "OTORRINOLARINGOLOGIA",
+    "02  ": "PEDIATRIA",
+    "4303": "PSICOLOGIA",
+    "36  ": "PSIQUIATRIA",
+    "38  ": "REUMATOLOGIA",
+    "40  ": "TRAUMATOLOGIA Y CIRUGIA ORTOPEDICA",
+    "44  ": "UNIDAD DE COLUMNA",
+    "41  ": "UROLOGIA",
 }
 
 HORAS = [f"{h:02d}:{m:02d}" for h in range(8, 21) for m in (0, 30)] + ["20:30"]
@@ -295,15 +296,18 @@ class MedasturScraper:
         fields["ddlCompania"]         = compania
         fields["ddlEspecialidad"]     = especialidad
         fields["ddlMedico"]           = medico
-        fields["nuevaCita_Fecha"]     = fecha
-        fields["horapreferente"]      = hora_desde
-        fields["horapreferentehasta"] = hora_hasta
-        fields["ddlLanguages"]        = "es"
-        fields["nuevaCita_id"]        = ""
-        fields["__EVENTTARGET"]       = "btnBuscarCitasLibres"
-        fields["__EVENTARGUMENT"]     = ""
-        fields["__LASTFOCUS"]         = ""
-        fields.pop("btnBuscarCitasLibres", None)  # button uses __doPostBack, not submit value
+        fields["datepicker"]              = fecha
+        fields["horapreferente"]          = hora_desde
+        fields["horapreferentehasta"]     = hora_hasta
+        fields["ddlLanguages"]            = "es"
+        fields["nuevaCita_id"]            = ""
+        fields["chkFormato_presencial"]   = "on"
+        fields["txtCodAutorizacion"]      = ""
+        fields["txtComentarioDiferida"]   = ""
+        fields["__EVENTTARGET"]           = ""
+        fields["__EVENTARGUMENT"]         = ""
+        fields["__LASTFOCUS"]             = ""
+        fields["btnBuscarCitasLibres"]    = "Buscar citas libres"
         logger.info("Search POST fields subset: compania=%r esp=%r medico=%r centro=%r",
                     compania, especialidad, medico, fields.get("ddlCentro"))
 
