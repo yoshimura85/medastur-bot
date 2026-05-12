@@ -256,6 +256,11 @@ class MedasturScraper:
             logger.info("After ddlCompania: centro=%r provincia=%r localidad=%r",
                         fields.get("ddlCentro"), fields.get("ddlProvincia"),
                         fields.get("ddlLocalidad"))
+            # Log available especialidad options to verify our code matches
+            esp_sel = soup.find("select", {"name": "ddlEspecialidad"})
+            if esp_sel:
+                esp_opts = [(o.get("value",""), o.get_text(strip=True)) for o in esp_sel.find_all("option")]
+                logger.info("ddlEspecialidad options: %r", esp_opts)
 
         # Step 3: PostBack especialidad → reloads ddlMedico
         if especialidad:
@@ -309,7 +314,8 @@ class MedasturScraper:
             logger.error("Search POST error: %s", e)
             return []
 
-        logger.info("Search response snippet: %s", resp.text[500:1200].replace("\n", " "))
+        page_plain = BeautifulSoup(resp.text, "html.parser").get_text(separator=" ", strip=True)
+        logger.info("Search page text (last 1500 chars): %s", page_plain[-1500:].replace("\n", " "))
         slots = self._parse_results(resp.text)
         logger.info("Found %d slots", len(slots))
         return slots
@@ -433,7 +439,7 @@ class MedasturScraper:
         if any(k in page_text for k in no_result_kw):
             return []
 
-        logger.debug("Could not parse results page. Snippet:\n%s", html[:800])
+        logger.info("No slots parsed. Page text sample: %s", page_text[-800:])
         return []
 
     def _extract_doctor(self, text: str) -> str:
