@@ -1,20 +1,27 @@
 """
-Check logic:
-  - Busca huecos disponibles para la especialidad/médico configurados
-  - Solo interesa lo que sea ANTERIOR a la cita que ya tiene el usuario
-  - Notifica si aparece un hueco nuevo más temprano
+Lógica de monitoreo:
+  - Busca todos los huecos disponibles para la especialidad configurada
+  - Agrupa por doctor y guarda el hueco más temprano de cada uno
+  - Notifica si algún doctor tiene ahora un hueco ANTERIOR al que tenía antes
 """
 import logging
 from datetime import date
 from typing import Callable, Awaitable
 
-from scraper import MedasturScraper, Slot, parse_spanish_date
-from storage import (
-    load_credentials, load_user_config,
-    load_known_slots, save_known_slots,
-)
+from scraper import MedasturScraper, Slot
+from storage import load_credentials, load_user_config, load_earliest, save_earliest
 
 logger = logging.getLogger(__name__)
+
+
+def _earliest_per_doctor(slots: list[Slot]) -> dict[str, Slot]:
+    """Devuelve el hueco más temprano por cada doctor."""
+    best: dict[str, Slot] = {}
+    for s in slots:
+        key = s.doctor or "SIN NOMBRE"
+        if key not in best or (s.fecha_dt, s.hora) < (best[key].fecha_dt, best[key].hora):
+            best[key] = s
+    return best
 
 
 async def check_for_user(
@@ -27,15 +34,8 @@ async def check_for_user(
 
     cfg = load_user_config(telegram_id)
     filters = cfg.get("filters", {})
-
-    # Parse the user's current appointment date (the "deadline")
-    cita_actual_str: str | None = cfg.get("cita_actual")
-    cita_actual: date | None = None
-    if cita_actual_str:
-        try:
-            cita_actual = date.fromisoformat(cita_actual_str)
-        except ValueError:
-            pass
+    if not filters.get("especialidad"):
+        return "⚠️ No hay especialidad configurada. Usa /filtros primero."
 
     username, password = creds
     scraper = MedasturScraper()
@@ -45,77 +45,50 @@ async def check_for_user(
         all_slots = scraper.search_slots(filters)
     except Exception as e:
         logger.exception("Error checking user %d", telegram_id)
-        return f"❌ Error al comprobar huecos: {e}"
+        return f"❌ Error al buscar huecos: {e}"
     finally:
         scraper.logout()
 
     if not all_slots:
-        return (
-            "📭 No hay huecos disponibles con los filtros actuales.\n"
-            + _filters_summary(filters, cita_actual)
+        esp = filters.get("especialidad_nombre", "")
+        return f"📭 No hay huecos disponibles para *{esp}* con los filtros actuales."
+
+    current_best = _earliest_per_doctor(all_slots)
+    previous_best: dict[str, dict] = load_earliest(telegram_id)
+
+    # Detect improvements: doctor has an earlier slot than before
+    alerts: list[str] = []
+    for doctor, slot in current_best.items():
+        prev = previous_best.get(doctor)
+        if prev is None:
+            # New doctor seen for first time — no alert, just record
+            continue
+        prev_date = date.fromisoformat(prev["fecha_dt"])
+        if slot.fecha_dt < prev_date:
+            alerts.append(
+                f"👨‍⚕️ *{doctor}*\n"
+                f"  Antes:  {prev_date.strftime('%d/%m/%Y')} {prev['hora']}\n"
+                f"  ✅ Ahora: {slot.fecha_dt.strftime('%d/%m/%Y')} {slot.hora}"
+            )
+
+    # Persist current best
+    save_earliest(telegram_id, {
+        doc: s.to_dict() for doc, s in current_best.items()
+    })
+
+    # Send alert if improvements found
+    if alerts:
+        esp = filters.get("especialidad_nombre", "")
+        msg = f"🔔 *¡Nuevo hueco anterior disponible!*\n_{esp}_\n\n" + "\n\n".join(alerts)
+        await notify(telegram_id, msg)
+
+    # Build the summary reply
+    esp = filters.get("especialidad_nombre", filters.get("especialidad", ""))
+    lines = [f"📋 *{esp}* — hueco más temprano por doctor:\n"]
+    for doctor, slot in sorted(current_best.items(),
+                                key=lambda x: (x[1].fecha_dt, x[1].hora)):
+        lines.append(
+            f"👨‍⚕️ *{doctor}*\n"
+            f"   📅 {slot.fecha_text.capitalize()}  🕐 {slot.hora}\n"
         )
-
-    # If user has a current appointment, only care about earlier slots
-    if cita_actual:
-        earlier = [s for s in all_slots if s.fecha_dt < cita_actual]
-    else:
-        earlier = all_slots
-
-    # Compare with previously known slots
-    prev_keys = {s["fecha_dt"] + "|" + s["hora"] + "|" + s["doctor"]
-                 for s in load_known_slots(telegram_id)}
-    new_slots = [s for s in earlier if s.key() not in prev_keys]
-
-    # Save ALL found slots (not just earlier ones) so we don't re-alert
-    save_known_slots(telegram_id, [s.to_dict() for s in all_slots])
-
-    if new_slots:
-        if cita_actual:
-            lines = [
-                f"🔔 *¡Nuevo hueco más temprano disponible!*\n",
-                f"_(Tu cita actual: {cita_actual.strftime('%d/%m/%Y')})_\n",
-            ]
-        else:
-            lines = [f"🔔 *{len(new_slots)} hueco(s) nuevo(s):*\n"]
-        for s in new_slots:
-            lines.append(str(s))
-            lines.append("")
-        await notify(telegram_id, "\n".join(lines))
-
-    # Build status reply
-    if cita_actual and not earlier:
-        earliest = all_slots[0]
-        return (
-            f"✅ Comprobado. No hay huecos antes de tu cita actual "
-            f"(*{cita_actual.strftime('%d/%m/%Y')}*).\n\n"
-            f"El más temprano disponible ahora:\n{earliest}"
-        )
-
-    if cita_actual and earlier:
-        lines = [
-            f"📋 *{len(earlier)} hueco(s) anteriores a tu cita ({cita_actual.strftime('%d/%m/%Y')}):*\n"
-        ]
-        for s in earlier:
-            lines.append(str(s))
-            lines.append("")
-        return "\n".join(lines)
-
-    # No cita_actual set
-    lines = [f"📋 *{len(all_slots)} hueco(s) disponibles:*\n"]
-    for s in all_slots[:10]:   # show max 10
-        lines.append(str(s))
-        lines.append("")
-    if len(all_slots) > 10:
-        lines.append(f"_...y {len(all_slots) - 10} más._")
     return "\n".join(lines)
-
-
-def _filters_summary(filters: dict, cita_actual: date | None) -> str:
-    parts = []
-    if filters.get("especialidad_nombre"):
-        parts.append(f"Especialidad: {filters['especialidad_nombre']}")
-    if filters.get("medico_nombre") and filters["medico_nombre"] != "cualquiera":
-        parts.append(f"Médico: {filters['medico_nombre']}")
-    if cita_actual:
-        parts.append(f"Buscando antes del: {cita_actual.strftime('%d/%m/%Y')}")
-    return "\n".join(parts)

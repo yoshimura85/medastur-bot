@@ -1,4 +1,4 @@
-"""Encrypted credential and state storage."""
+"""Encrypted credential and JSON state storage."""
 import json
 import os
 from pathlib import Path
@@ -10,71 +10,86 @@ load_dotenv()
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-CREDS_FILE = DATA_DIR / "credentials.json"
-STATE_FILE = DATA_DIR / "slots.json"
-USERS_FILE = DATA_DIR / "users.json"
+_CREDS   = DATA_DIR / "credentials.json"
+_USERS   = DATA_DIR / "users.json"
+_EARLIEST = DATA_DIR / "earliest.json"   # earliest slot per doctor per user
 
 
-def _get_fernet() -> Fernet:
+# ── Encryption ────────────────────────────────────────────────────────────────
+
+def _fernet() -> Fernet:
     key = os.getenv("ENCRYPTION_KEY")
     if not key:
         key = Fernet.generate_key().decode()
-        env_path = Path(__file__).parent / ".env"
-        with open(env_path, "a") as f:
+        with open(Path(__file__).parent / ".env", "a") as f:
             f.write(f"\nENCRYPTION_KEY={key}\n")
     return Fernet(key.encode() if isinstance(key, str) else key)
 
 
-def save_credentials(telegram_id: int, username: str, password: str) -> None:
-    fernet = _get_fernet()
-    data = _load(CREDS_FILE)
-    data[str(telegram_id)] = {
-        "username": fernet.encrypt(username.encode()).decode(),
-        "password": fernet.encrypt(password.encode()).decode(),
+# ── Credentials ───────────────────────────────────────────────────────────────
+
+def save_credentials(tid: int, username: str, password: str) -> None:
+    fn = _fernet()
+    data = _load(_CREDS)
+    data[str(tid)] = {
+        "username": fn.encrypt(username.encode()).decode(),
+        "password": fn.encrypt(password.encode()).decode(),
     }
-    _save(CREDS_FILE, data)
+    _save(_CREDS, data)
 
 
-def load_credentials(telegram_id: int) -> tuple[str, str] | None:
-    data = _load(CREDS_FILE)
-    entry = data.get(str(telegram_id))
+def load_credentials(tid: int) -> tuple[str, str] | None:
+    entry = _load(_CREDS).get(str(tid))
     if not entry:
         return None
-    fernet = _get_fernet()
-    return (fernet.decrypt(entry["username"].encode()).decode(),
-            fernet.decrypt(entry["password"].encode()).decode())
+    fn = _fernet()
+    return (fn.decrypt(entry["username"].encode()).decode(),
+            fn.decrypt(entry["password"].encode()).decode())
 
 
-def delete_credentials(telegram_id: int) -> None:
-    data = _load(CREDS_FILE)
-    data.pop(str(telegram_id), None)
-    _save(CREDS_FILE, data)
+def delete_credentials(tid: int) -> None:
+    data = _load(_CREDS)
+    data.pop(str(tid), None)
+    _save(_CREDS, data)
 
 
-def save_user_config(telegram_id: int, update: dict) -> None:
-    data = _load(USERS_FILE)
-    data.setdefault(str(telegram_id), {}).update(update)
-    _save(USERS_FILE, data)
+# ── User config ───────────────────────────────────────────────────────────────
+
+def save_user_config(tid: int, update: dict) -> None:
+    data = _load(_USERS)
+    data.setdefault(str(tid), {}).update(update)
+    _save(_USERS, data)
 
 
-def load_user_config(telegram_id: int) -> dict:
-    return _load(USERS_FILE).get(str(telegram_id), {})
+def load_user_config(tid: int) -> dict:
+    return _load(_USERS).get(str(tid), {})
 
 
 def get_all_monitoring_users() -> list[int]:
-    return [int(uid) for uid, cfg in _load(USERS_FILE).items()
-            if cfg.get("monitoring")]
+    return [int(uid) for uid, cfg in _load(_USERS).items() if cfg.get("monitoring")]
 
 
-def save_known_slots(telegram_id: int, slots: list[dict]) -> None:
-    data = _load(STATE_FILE)
-    data[str(telegram_id)] = slots
-    _save(STATE_FILE, data)
+# ── Earliest slots per doctor ─────────────────────────────────────────────────
+
+def save_earliest(tid: int, earliest: dict[str, dict]) -> None:
+    """earliest = {doctor_name: slot.to_dict()}"""
+    data = _load(_EARLIEST)
+    data[str(tid)] = earliest
+    _save(_EARLIEST, data)
 
 
-def load_known_slots(telegram_id: int) -> list[dict]:
-    return _load(STATE_FILE).get(str(telegram_id), [])
+def load_earliest(tid: int) -> dict[str, dict]:
+    """Returns {doctor_name: slot_dict} or {} if not set."""
+    return _load(_EARLIEST).get(str(tid), {})
 
+
+def clear_earliest(tid: int) -> None:
+    data = _load(_EARLIEST)
+    data.pop(str(tid), None)
+    _save(_EARLIEST, data)
+
+
+# ── JSON helpers ──────────────────────────────────────────────────────────────
 
 def _load(path: Path) -> dict:
     if path.exists():
