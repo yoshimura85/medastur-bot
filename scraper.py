@@ -70,7 +70,7 @@ class MedasturScraper:
         self._logged_in = False
 
     def _get_aspnet_fields(self, html: str) -> dict:
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "html.parser")
         fields = {}
         for name in ("__VIEWSTATE", "__EVENTVALIDATION", "__VIEWSTATEGENERATOR",
                      "__EVENTTARGET", "__EVENTARGUMENT"):
@@ -81,7 +81,7 @@ class MedasturScraper:
 
     def _discover_login_fields(self, html: str) -> dict[str, str]:
         """Try to find the username/password input names dynamically."""
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "html.parser")
         field_map: dict[str, str] = {}
 
         for inp in soup.find_all("input"):
@@ -108,7 +108,7 @@ class MedasturScraper:
         return field_map
 
     def _find_submit_button(self, html: str) -> dict[str, str]:
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "html.parser")
         for btn in soup.find_all(["input", "button"]):
             btype = btn.get("type", "").lower()
             bval = (btn.get("value", "") + btn.get("id", "")).lower()
@@ -191,7 +191,7 @@ class MedasturScraper:
     def _scan_from_home(self) -> list[Appointment]:
         try:
             resp = self.session.get(HOME_URL, timeout=20)
-            soup = BeautifulSoup(resp.text, "lxml")
+            soup = BeautifulSoup(resp.text, "html.parser")
             for link in soup.find_all("a", href=True):
                 href = link["href"]
                 text = link.get_text(strip=True).lower()
@@ -209,7 +209,7 @@ class MedasturScraper:
         return []
 
     def _parse_appointments(self, html: str) -> list[Appointment] | None:
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "html.parser")
         appointments: list[Appointment] = []
 
         # Strategy 1: look for table rows with appointment-like data
