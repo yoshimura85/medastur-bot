@@ -1,21 +1,23 @@
 """
-Bot de Telegram para monitorizar huecos en paciente.medastur.com/autoservicio.aspx
+Bot de Telegram — Medastur appointment monitor
 
 Comandos:
   /start      Bienvenida
   /login      Guardar credenciales (conversación)
   /logout     Borrar credenciales
-  /filtros    Configurar filtros de búsqueda (conversación)
+  /filtros    Configurar qué monitorizar (conversación)
   /check      Buscar huecos ahora
   /monitor    Activar monitoreo automático
   /stop       Detener monitoreo
-  /interval   Cambiar intervalo (minutos)
-  /status     Estado actual
+  /interval   Cambiar intervalo en minutos
+  /status     Ver configuración actual
   /help       Ayuda
 """
 import asyncio
 import logging
 import os
+import re
+from datetime import date
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -29,7 +31,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from checker import check_for_user
-from scraper import COMPANIAS, ESPECIALIDADES_DEFAULT, HORAS
+from scraper import COMPANIAS, ESPECIALIDADES, HORAS
 from storage import (
     delete_credentials, get_all_monitoring_users,
     load_credentials, load_user_config,
@@ -43,9 +45,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Conversation states ───────────────────────────────────────────────────────
+# ── States ────────────────────────────────────────────────────────────────────
 (ASK_USER, ASK_PASS) = range(2)
-(F_COMPANIA, F_ESPECIALIDAD, F_MEDICO, F_HORA_DESDE, F_HORA_HASTA) = range(5)
+(F_COMPANIA, F_ESPECIALIDAD, F_MEDICO, F_CITA_ACTUAL) = range(4)
 (ASK_INTERVAL,) = range(1)
 
 DEFAULT_INTERVAL = 30
@@ -55,7 +57,7 @@ scheduler = AsyncIOScheduler()
 _app: Optional[Application] = None
 
 
-# ── Scheduler helpers ─────────────────────────────────────────────────────────
+# ── Scheduler ─────────────────────────────────────────────────────────────────
 
 async def _notify(tid: int, msg: str) -> None:
     if _app:
@@ -73,231 +75,211 @@ def _reschedule(tid: int, minutes: int) -> None:
         scheduler.remove_job(jid)
     scheduler.add_job(_scheduled_check, IntervalTrigger(minutes=minutes),
                       id=jid, args=[tid], replace_existing=True)
+    logger.info("Scheduled %s every %d min", jid, minutes)
 
 
-def _remove_schedule(tid: int) -> None:
+def _unschedule(tid: int) -> None:
     jid = f"check_{tid}"
     if scheduler.get_job(jid):
         scheduler.remove_job(jid)
 
 
-# ── Utility ───────────────────────────────────────────────────────────────────
+# ── UI helpers ────────────────────────────────────────────────────────────────
 
-async def _reply(update: Update, text: str, keyboard=None, **kw) -> None:
+async def _reply(update: Update, text: str, keyboard: list | None = None) -> None:
     markup = (ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
               if keyboard else ReplyKeyboardRemove())
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
-                                    reply_markup=markup, **kw)
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
+    )
 
 
-def _option_keyboard(options: list[str], cols: int = 2) -> list[list[str]]:
-    rows = []
-    for i in range(0, len(options), cols):
-        rows.append(options[i:i + cols])
-    return rows
+def _kbd(items: list[str], cols: int = 2) -> list[list[str]]:
+    return [items[i:i + cols] for i in range(0, len(items), cols)]
 
 
-# ── /start & /help ────────────────────────────────────────────────────────────
+# ── /start & /help ─────────────────────────────────────────────────────────────
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(update,
         "👋 *Bot de Citas Medastur*\n\n"
-        "Monitoriza huecos libres en *paciente.medastur.com* y te avisa "
-        "cuando aparezca alguno.\n\n"
-        "1️⃣ /login — introduce tus credenciales\n"
-        "2️⃣ /filtros — elige especialidad, médico y horario\n"
-        "3️⃣ /monitor — activa las alertas automáticas\n\n"
-        "/help para ver todos los comandos.")
+        "Te aviso cuando haya un hueco *más temprano* que tu cita actual.\n\n"
+        "1️⃣ /login — credenciales del portal\n"
+        "2️⃣ /filtros — especialidad, médico y tu cita actual\n"
+        "3️⃣ /monitor — activar alertas automáticas\n\n"
+        "/help para todos los comandos.")
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(update,
-        "*Comandos disponibles:*\n\n"
+        "*Comandos:*\n\n"
         "/login — Guardar credenciales del portal\n"
         "/logout — Borrar credenciales\n"
-        "/filtros — Configurar qué buscar (especialidad, médico, horario)\n"
+        "/filtros — Configurar qué buscar\n"
         "/check — Buscar huecos ahora mismo\n"
-        "/monitor — Activar comprobaciones automáticas\n"
-        "/stop — Detener comprobaciones\n"
-        "/interval — Cambiar intervalo (mínimo 5 min)\n"
+        "/monitor — Activar alertas automáticas\n"
+        "/stop — Detener alertas\n"
+        "/interval — Cambiar frecuencia de comprobación\n"
         "/status — Ver configuración actual\n"
         "/help — Esta ayuda")
 
 
 # ── /login ────────────────────────────────────────────────────────────────────
 
-async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def login_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> int:
     await _reply(update,
-        "🔐 Introduce tu *usuario o DNI* del portal Medastur:\n"
-        "_(escribe /cancelar para abortar)_")
+        "🔐 Escribe tu *usuario o DNI* del portal paciente.medastur.com:\n"
+        "_(o /cancelar para salir)_")
     return ASK_USER
 
 
-async def login_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["_login_user"] = update.message.text.strip()
-    await _reply(update, "🔑 Ahora introduce tu *contraseña*:")
+async def login_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["_u"] = update.message.text.strip()
+    await _reply(update, "🔑 Ahora tu *contraseña*:")
     return ASK_PASS
 
 
-async def login_pass(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def login_pass(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     tid = update.effective_user.id
-    username = context.user_data.pop("_login_user", "")
-    password = update.message.text.strip()
+    u = ctx.user_data.pop("_u", "")
+    p = update.message.text.strip()
     try:
         await update.message.delete()
     except Exception:
         pass
-    if not username or not password:
-        await _reply(update, "❌ Datos vacíos. Usa /login para intentarlo de nuevo.")
+    if not u or not p:
+        await _reply(update, "❌ Datos vacíos. Usa /login de nuevo.")
         return ConversationHandler.END
-    save_credentials(tid, username, password)
+    save_credentials(tid, u, p)
     await _reply(update,
         "✅ Credenciales guardadas.\n\n"
-        "Usa /filtros para configurar qué especialidad buscar,\n"
-        "o /check para probar ahora mismo.")
+        "Ahora usa /filtros para elegir la especialidad a monitorizar.")
     return ConversationHandler.END
 
 
-async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def conv_cancel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> int:
     await _reply(update, "❌ Cancelado.")
     return ConversationHandler.END
 
 
 # ── /logout ───────────────────────────────────────────────────────────────────
 
-async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_logout(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     tid = update.effective_user.id
     delete_credentials(tid)
-    _remove_schedule(tid)
+    _unschedule(tid)
     save_user_config(tid, {"monitoring": False})
     await _reply(update, "🗑️ Credenciales eliminadas y monitoreo detenido.")
 
 
 # ── /filtros ──────────────────────────────────────────────────────────────────
-# States: F_COMPANIA → F_ESPECIALIDAD → F_MEDICO → F_HORA_DESDE → F_HORA_HASTA
 
-def _compania_keyboard() -> list[list[str]]:
-    labels = [f"{v}" for k, v in COMPANIAS.items() if k]
-    return _option_keyboard(labels, cols=1)
-
-
-def _especialidad_keyboard() -> list[list[str]]:
-    labels = [v for k, v in ESPECIALIDADES_DEFAULT.items() if k]
-    return _option_keyboard(labels, cols=1)
-
-
-def _hora_keyboard() -> list[list[str]]:
-    return _option_keyboard(HORAS, cols=4)
-
-
-async def filtros_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    cfg = load_user_config(update.effective_user.id)
+async def filtros_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    tid = update.effective_user.id
+    cfg = load_user_config(tid)
     f = cfg.get("filters", {})
-    current = (
-        f"Compañía: *{COMPANIAS.get(f.get('compania',''), 'cualquiera')}*\n"
-        f"Especialidad: *{ESPECIALIDADES_DEFAULT.get(f.get('especialidad',''), f.get('especialidad','cualquiera'))}*\n"
-        f"Médico: *{f.get('medico_nombre','cualquiera')}*\n"
-        f"Hora desde: *{f.get('hora_desde','08:00')}*  hasta: *{f.get('hora_hasta','20:30')}*"
-    )
+    cita = cfg.get("cita_actual", "no configurada")
+
     await _reply(update,
-        f"⚙️ *Configuración actual de filtros:*\n{current}\n\n"
-        "Elige la *compañía* aseguradora:\n_(escribe /cancelar para salir)_",
-        keyboard=_compania_keyboard())
-    context.user_data["_filters"] = dict(f)
+        f"⚙️ *Configuración actual:*\n"
+        f"🏥 Compañía: *{f.get('compania_nombre', 'cualquiera')}*\n"
+        f"🩺 Especialidad: *{f.get('especialidad_nombre', 'no configurada')}*\n"
+        f"👨‍⚕️ Médico: *{f.get('medico_nombre', 'cualquiera')}*\n"
+        f"📅 Tu cita actual: *{cita}*\n\n"
+        "Elige tu *compañía* aseguradora:\n_(o /cancelar para salir)_",
+        keyboard=_kbd([v for k, v in COMPANIAS.items() if k], cols=1))
+    ctx.user_data["_f"] = {}
     return F_COMPANIA
 
 
-async def filtros_compania(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    # Resolve label → value
-    compania_val = ""
-    for k, v in COMPANIAS.items():
-        if v.upper() == text.upper() or k == text:
-            compania_val = k
-            break
-    context.user_data["_filters"]["compania"] = compania_val
-    context.user_data["_filters"]["compania_nombre"] = COMPANIAS.get(compania_val, text)
+async def filtros_compania(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip().upper()
+    val = next((k for k, v in COMPANIAS.items() if v.upper() == text), "")
+    ctx.user_data["_f"]["compania"] = val
+    ctx.user_data["_f"]["compania_nombre"] = COMPANIAS.get(val, text)
 
     await _reply(update,
-        "Elige la *especialidad* médica:\n_(escribe /cancelar para salir)_",
-        keyboard=_especialidad_keyboard())
+        "Elige la *especialidad* a monitorizar:",
+        keyboard=_kbd([v for k, v in ESPECIALIDADES.items() if k], cols=1))
     return F_ESPECIALIDAD
 
 
-async def filtros_especialidad(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    esp_val = ""
-    for k, v in ESPECIALIDADES_DEFAULT.items():
-        if v.upper() == text.upper() or k.strip() == text.strip():
-            esp_val = k
-            break
-    context.user_data["_filters"]["especialidad"] = esp_val
-    context.user_data["_filters"]["especialidad_nombre"] = ESPECIALIDADES_DEFAULT.get(esp_val, text)
+async def filtros_especialidad(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip().upper()
+    val = next((k for k, v in ESPECIALIDADES.items()
+                if v.upper() == text or k.strip() == text.strip()), "")
+    ctx.user_data["_f"]["especialidad"] = val
+    ctx.user_data["_f"]["especialidad_nombre"] = ESPECIALIDADES.get(val, text)
 
     await _reply(update,
-        "¿Quieres filtrar por un *médico concreto*?\n"
-        "Escribe su nombre o envía *cualquiera* para no filtrar:",
+        "¿Quieres un *médico concreto*? Escribe su nombre,\n"
+        "o pulsa *cualquiera* para no filtrar por doctor:",
         keyboard=[["cualquiera"]])
     return F_MEDICO
 
 
-async def filtros_medico(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def filtros_medico(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
     if text.lower() in ("cualquiera", "-", ""):
-        context.user_data["_filters"]["medico"] = ""
-        context.user_data["_filters"]["medico_nombre"] = "cualquiera"
+        ctx.user_data["_f"]["medico"] = ""
+        ctx.user_data["_f"]["medico_nombre"] = "cualquiera"
     else:
-        context.user_data["_filters"]["medico"] = text
-        context.user_data["_filters"]["medico_nombre"] = text
+        ctx.user_data["_f"]["medico"] = text.upper()
+        ctx.user_data["_f"]["medico_nombre"] = text.upper()
 
     await _reply(update,
-        "¿A partir de qué *hora* quieres la cita? (hora de inicio)",
-        keyboard=_hora_keyboard())
-    return F_HORA_DESDE
+        "📅 ¿Cuál es tu *cita actual* (la que quieres adelantar)?\n\n"
+        "Escribe la fecha en formato *DD/MM/YYYY*\n"
+        "_(o 'ninguna' si no tienes cita)_")
+    return F_CITA_ACTUAL
 
 
-async def filtros_hora_desde(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    hora = update.message.text.strip()
-    if hora not in HORAS:
-        await _reply(update, "❌ Hora no válida. Elige una de la lista:",
-                     keyboard=_hora_keyboard())
-        return F_HORA_DESDE
-    context.user_data["_filters"]["hora_desde"] = hora
-
-    await _reply(update,
-        f"¿Hasta qué *hora* (hora límite)?",
-        keyboard=_hora_keyboard())
-    return F_HORA_HASTA
-
-
-async def filtros_hora_hasta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def filtros_cita_actual(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     tid = update.effective_user.id
-    hora = update.message.text.strip()
-    if hora not in HORAS:
-        await _reply(update, "❌ Hora no válida. Elige una de la lista:",
-                     keyboard=_hora_keyboard())
-        return F_HORA_HASTA
+    text = update.message.text.strip()
+    f = ctx.user_data.pop("_f", {})
 
-    f = context.user_data.pop("_filters", {})
-    f["hora_hasta"] = hora
-    save_user_config(tid, {"filters": f})
+    cita_iso = None
+    if text.lower() not in ("ninguna", "no", "none", "-", ""):
+        m = re.match(r"(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{4})", text)
+        if not m:
+            await _reply(update,
+                "❌ Formato no válido. Escribe la fecha como *DD/MM/YYYY* "
+                "(ej: 01/07/2026):")
+            ctx.user_data["_f"] = f
+            return F_CITA_ACTUAL
+        d, mo, y = m.groups()
+        try:
+            cita_iso = date(int(y), int(mo), int(d)).isoformat()
+        except ValueError:
+            await _reply(update, "❌ Fecha inválida. Inténtalo de nuevo:")
+            ctx.user_data["_f"] = f
+            return F_CITA_ACTUAL
 
-    esp = f.get("especialidad_nombre", "cualquiera")
+    save_user_config(tid, {
+        "filters": f,
+        "cita_actual": cita_iso,
+    })
+
+    esp = f.get("especialidad_nombre", "no configurada")
     med = f.get("medico_nombre", "cualquiera")
     cia = f.get("compania_nombre", "cualquiera")
+    cita_text = date.fromisoformat(cita_iso).strftime("%d/%m/%Y") if cita_iso else "no configurada"
+
     await _reply(update,
         f"✅ *Filtros guardados:*\n\n"
         f"🏥 Compañía: *{cia}*\n"
         f"🩺 Especialidad: *{esp}*\n"
         f"👨‍⚕️ Médico: *{med}*\n"
-        f"🕐 Horario: *{f.get('hora_desde','08:00')} – {hora}*\n\n"
-        "Usa /check para probar o /monitor para activar alertas automáticas.")
+        f"📅 Tu cita actual: *{cita_text}*\n\n"
+        "Usa /check para probar ahora,\n"
+        "o /monitor para activar las alertas automáticas.")
     return ConversationHandler.END
 
 
 # ── /check ────────────────────────────────────────────────────────────────────
 
-async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_check(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     tid = update.effective_user.id
     if not load_credentials(tid):
         await _reply(update, "❌ No hay credenciales. Usa /login primero.")
@@ -309,84 +291,93 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── /monitor & /stop ──────────────────────────────────────────────────────────
 
-async def cmd_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_monitor(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     tid = update.effective_user.id
     if not load_credentials(tid):
         await _reply(update, "❌ No hay credenciales. Usa /login primero.")
         return
     cfg = load_user_config(tid)
+    if not cfg.get("filters", {}).get("especialidad"):
+        await _reply(update,
+            "⚠️ Aún no has configurado la especialidad.\n"
+            "Usa /filtros primero.")
+        return
     minutes = cfg.get("interval_minutes", DEFAULT_INTERVAL)
     _reschedule(tid, minutes)
-    save_user_config(tid, {"monitoring": True, "interval_minutes": minutes})
+    save_user_config(tid, {"monitoring": True})
+
+    cita = cfg.get("cita_actual")
+    cita_text = (f"Tu cita actual: *{date.fromisoformat(cita).strftime('%d/%m/%Y')}*"
+                 if cita else "_Sin cita de referencia configurada_")
+
     await _reply(update,
-        f"✅ Monitoreo activado. Compruebo cada *{minutes} minutos*.\n"
-        "Te notificaré si aparece algún hueco nuevo.\n\n"
-        "Usa /stop para pausarlo · /interval para cambiar la frecuencia.")
+        f"✅ Monitoreo activado — compruebo cada *{minutes} minutos*.\n"
+        f"{cita_text}\n\n"
+        "Te aviso si aparece un hueco anterior.\n"
+        "Usa /stop para pausar · /interval para cambiar la frecuencia.")
 
 
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_stop(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     tid = update.effective_user.id
-    _remove_schedule(tid)
+    _unschedule(tid)
     save_user_config(tid, {"monitoring": False})
     await _reply(update, "⏹️ Monitoreo detenido. Usa /monitor para reactivarlo.")
 
 
 # ── /interval ─────────────────────────────────────────────────────────────────
 
-async def interval_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def interval_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> int:
     cfg = load_user_config(update.effective_user.id)
     cur = cfg.get("interval_minutes", DEFAULT_INTERVAL)
     await _reply(update,
         f"⏱️ Intervalo actual: *{cur} minutos*\n\n"
         f"Escribe el nuevo intervalo en minutos (mínimo {MIN_INTERVAL}):\n"
-        "_(escribe /cancelar para salir)_")
+        "_(o /cancelar para salir)_")
     return 0
 
 
-async def interval_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def interval_set(update: Update, _: ContextTypes.DEFAULT_TYPE) -> int:
     tid = update.effective_user.id
     try:
         minutes = int(update.message.text.strip())
         if minutes < MIN_INTERVAL:
-            await _reply(update, f"❌ Mínimo {MIN_INTERVAL} minutos:")
+            await _reply(update, f"❌ Mínimo {MIN_INTERVAL} minutos. Inténtalo de nuevo:")
             return 0
     except ValueError:
         await _reply(update, "❌ Escribe un número entero:")
         return 0
 
     save_user_config(tid, {"interval_minutes": minutes})
-    cfg = load_user_config(tid)
-    if cfg.get("monitoring"):
+    if load_user_config(tid).get("monitoring"):
         _reschedule(tid, minutes)
         await _reply(update, f"✅ Intervalo actualizado a *{minutes} minutos* y monitoreo reprogramado.")
     else:
-        await _reply(update, f"✅ Intervalo guardado: *{minutes} minutos*. Activa el monitoreo con /monitor.")
+        await _reply(update, f"✅ Intervalo guardado: *{minutes} minutos*.\nActiva el monitoreo con /monitor.")
     return ConversationHandler.END
 
 
 # ── /status ───────────────────────────────────────────────────────────────────
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     tid = update.effective_user.id
     has_creds = load_credentials(tid) is not None
     cfg = load_user_config(tid)
-    monitoring = cfg.get("monitoring", False)
+    monitoring = cfg.get("monitoring", False) and scheduler.get_job(f"check_{tid}") is not None
     minutes = cfg.get("interval_minutes", DEFAULT_INTERVAL)
-    active = scheduler.get_job(f"check_{tid}") is not None
     f = cfg.get("filters", {})
+    cita = cfg.get("cita_actual")
+    cita_text = date.fromisoformat(cita).strftime("%d/%m/%Y") if cita else "no configurada"
 
-    lines = ["*Estado del monitoreo:*\n"]
-    lines.append(f"🔐 Credenciales: {'✅ guardadas' if has_creds else '❌ no configuradas'}")
-    lines.append(f"📡 Monitoreo: {'✅ activo' if monitoring and active else '⏹️ inactivo'}")
-    lines.append(f"⏱️ Intervalo: cada *{minutes} minutos*")
-    lines.append("")
-    lines.append("*Filtros de búsqueda:*")
-    lines.append(f"🏥 Compañía: *{f.get('compania_nombre','cualquiera')}*")
-    lines.append(f"🩺 Especialidad: *{f.get('especialidad_nombre','cualquiera')}*")
-    lines.append(f"👨‍⚕️ Médico: *{f.get('medico_nombre','cualquiera')}*")
-    lines.append(f"🕐 Horario: *{f.get('hora_desde','08:00')} – {f.get('hora_hasta','20:30')}*")
-
-    await _reply(update, "\n".join(lines))
+    await _reply(update,
+        "*Estado actual:*\n\n"
+        f"🔐 Credenciales: {'✅ guardadas' if has_creds else '❌ no configuradas'}\n"
+        f"📡 Monitoreo: {'✅ activo' if monitoring else '⏹️ inactivo'}\n"
+        f"⏱️ Intervalo: cada *{minutes} minutos*\n\n"
+        "*Filtros:*\n"
+        f"🏥 Compañía: *{f.get('compania_nombre','cualquiera')}*\n"
+        f"🩺 Especialidad: *{f.get('especialidad_nombre','no configurada')}*\n"
+        f"👨‍⚕️ Médico: *{f.get('medico_nombre','cualquiera')}*\n"
+        f"📅 Tu cita actual: *{cita_text}*")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -418,8 +409,7 @@ def main() -> None:
             F_COMPANIA:    [MessageHandler(filters.TEXT & ~filters.COMMAND, filtros_compania), cancel_cmd],
             F_ESPECIALIDAD:[MessageHandler(filters.TEXT & ~filters.COMMAND, filtros_especialidad), cancel_cmd],
             F_MEDICO:      [MessageHandler(filters.TEXT & ~filters.COMMAND, filtros_medico), cancel_cmd],
-            F_HORA_DESDE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, filtros_hora_desde), cancel_cmd],
-            F_HORA_HASTA:  [MessageHandler(filters.TEXT & ~filters.COMMAND, filtros_hora_hasta), cancel_cmd],
+            F_CITA_ACTUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, filtros_cita_actual), cancel_cmd],
         },
         fallbacks=[cancel_cmd],
     )
@@ -432,22 +422,26 @@ def main() -> None:
         fallbacks=[cancel_cmd],
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(login_conv)
-    app.add_handler(CommandHandler("logout", cmd_logout))
-    app.add_handler(filtros_conv)
-    app.add_handler(CommandHandler("check", cmd_check))
-    app.add_handler(CommandHandler("monitor", cmd_monitor))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(interval_conv)
-    app.add_handler(CommandHandler("status", cmd_status))
+    for handler in (
+        CommandHandler("start", cmd_start),
+        CommandHandler("help", cmd_help),
+        login_conv,
+        CommandHandler("logout", cmd_logout),
+        filtros_conv,
+        CommandHandler("check", cmd_check),
+        CommandHandler("monitor", cmd_monitor),
+        CommandHandler("stop", cmd_stop),
+        interval_conv,
+        CommandHandler("status", cmd_status),
+    ):
+        app.add_handler(handler)
 
     async def on_startup(app: Application) -> None:
         scheduler.start()
         for tid in get_all_monitoring_users():
             cfg = load_user_config(tid)
             _reschedule(tid, cfg.get("interval_minutes", DEFAULT_INTERVAL))
+            logger.info("Restored monitoring for user %d", tid)
 
     async def on_shutdown(app: Application) -> None:
         scheduler.shutdown(wait=False)

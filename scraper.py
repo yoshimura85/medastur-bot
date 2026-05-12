@@ -1,26 +1,22 @@
 """
 Scraper for paciente.medastur.com/autoservicio.aspx
 
-Flow:
-  1. GET /Login.aspx  → extract ViewState, discover field names
-  2. POST credentials → session established
-  3. GET /autoservicio.aspx → extract ViewState + current dropdown values
-  4. POST __EVENTTARGET=ddlCompania  → reload especialidades (cascade)
-  5. POST __EVENTTARGET=ddlEspecialidad → reload ddlMedico (cascade)
-  6. POST btnBuscarCitasLibres → search results
-  7. Parse result table
+POST cascade:
+  1. GET  /autoservicio.aspx          → ViewState + initial dropdowns
+  2. POST __EVENTTARGET=ddlCompania   → reload especialidades
+  3. POST __EVENTTARGET=ddlEspecialidad → reload ddlMedico
+  4. POST btnBuscarCitasLibres        → result cards
 """
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 import requests
 from bs4 import BeautifulSoup
 
 BASE_URL  = "https://paciente.medastur.com"
 LOGIN_URL = f"{BASE_URL}/Login.aspx"
-HOME_URL  = f"{BASE_URL}/Inicio.aspx"
 AUTO_URL  = f"{BASE_URL}/autoservicio.aspx"
 
 HEADERS = {
@@ -35,18 +31,18 @@ HEADERS = {
 
 logger = logging.getLogger(__name__)
 
-# ── Known option catalogues (from live inspection) ────────────────────────────
+# ── Catalogues (from live inspection) ────────────────────────────────────────
 
 COMPANIAS = {
-    "": "- Elige compañia -",
+    "":      "- Elige compañía -",
     "00999": "CLIENTES PARTICULARES",
     "00001": "ASISA",
     "00323": "CIGNA HEALTHCARE ESPAÑA",
     "00030": "SANITAS",
 }
 
-ESPECIALIDADES_DEFAULT = {
-    "": "- Elige Especialidad -",
+ESPECIALIDADES = {
+    "":     "- Elige Especialidad -",
     "03  ": "ALERGOLOGIA",
     "09  ": "CARDIOLOGIA",
     "0901": "CARDIOLOGIA INFANTIL",
@@ -57,7 +53,7 @@ ESPECIALIDADES_DEFAULT = {
     "14  ": "CIRUGIA PLASTICA Y REPARADORA",
     "07  ": "CIRUGIA VASCULAR",
     "16  ": "DERMATOLOGIA",
-    "4306": "DIETÉTICA Y NUTRICIÓN",
+    "4306": "DIETETICA Y NUTRICION",
     "08  ": "DIGESTIVO",
     "21  ": "HEMATOLOGIA Y HEMOTERAPIA",
     "4307": "LOGOPEDIA",
@@ -82,38 +78,76 @@ ESPECIALIDADES_DEFAULT = {
 
 HORAS = [f"{h:02d}:{m:02d}" for h in range(8, 21) for m in (0, 30)] + ["20:30"]
 
+_MESES = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+    "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+    "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12,
+}
+
+# Regex for Spanish long date: "martes, 7 de julio de 2026 a las 17:35"
+_DATE_RE = re.compile(
+    r"(\d{1,2})\s+de\s+(\w+)\s+de\s+(\d{4})\s+a\s+las\s+(\d{1,2}:\d{2})",
+    re.IGNORECASE,
+)
+
 
 # ── Data class ────────────────────────────────────────────────────────────────
 
 @dataclass
 class Slot:
-    fecha: str
-    hora: str
+    fecha_dt: date        # parsed date for comparison
+    hora: str             # "17:35"
     doctor: str
-    consulta: str
     centro: str
+    fecha_text: str       # "martes, 7 de julio de 2026"
 
     def key(self) -> str:
-        return f"{self.fecha}|{self.hora}|{self.doctor}"
+        return f"{self.fecha_dt.isoformat()}|{self.hora}|{self.doctor}"
 
     def to_dict(self) -> dict:
-        return {"fecha": self.fecha, "hora": self.hora,
-                "doctor": self.doctor, "consulta": self.consulta,
-                "centro": self.centro}
+        return {
+            "fecha_dt": self.fecha_dt.isoformat(),
+            "hora": self.hora,
+            "doctor": self.doctor,
+            "centro": self.centro,
+            "fecha_text": self.fecha_text,
+        }
 
     @classmethod
     def from_dict(cls, d: dict) -> "Slot":
-        return cls(**d)
+        return cls(
+            fecha_dt=date.fromisoformat(d["fecha_dt"]),
+            hora=d["hora"],
+            doctor=d["doctor"],
+            centro=d["centro"],
+            fecha_text=d.get("fecha_text", d["fecha_dt"]),
+        )
 
     def __str__(self) -> str:
-        lines = [f"📅 {self.fecha}  🕐 {self.hora}"]
+        lines = [f"📅 {self.fecha_text.capitalize()}  🕐 {self.hora}"]
         if self.doctor:
             lines.append(f"👨‍⚕️ {self.doctor}")
-        if self.consulta:
-            lines.append(f"🏥 {self.consulta}")
         if self.centro:
             lines.append(f"📍 {self.centro}")
         return "\n".join(lines)
+
+
+def parse_spanish_date(text: str) -> tuple[date, str, str] | None:
+    """Parse 'martes, 7 de julio de 2026 a las 17:35' → (date, hora, fecha_text)."""
+    m = _DATE_RE.search(text)
+    if not m:
+        return None
+    dia, mes_str, anio, hora = m.groups()
+    mes = _MESES.get(mes_str.lower())
+    if not mes:
+        return None
+    try:
+        dt = date(int(anio), mes, int(dia))
+    except ValueError:
+        return None
+    # Capture the date portion text (before "a las")
+    fecha_text = text[:m.start() + text[m.start():].index(" a las")].strip().lstrip(",").strip()
+    return dt, hora, fecha_text
 
 
 # ── Scraper ───────────────────────────────────────────────────────────────────
@@ -136,123 +170,122 @@ class MedasturScraper:
 
         soup = BeautifulSoup(resp.text, "html.parser")
         hidden = self._aspnet_fields(soup)
-        user_field, pass_field, submit = self._discover_login_fields(soup)
+        user_f, pass_f, submit = self._discover_login_fields(soup)
 
-        if not user_field or not pass_field:
-            logger.error("Could not detect login form fields")
+        if not user_f or not pass_f:
+            logger.error("Login fields not found in page")
             return False
 
-        payload = {
-            user_field: username,
-            pass_field: password,
-            **hidden,
-        }
+        payload = {user_f: username, pass_f: password, **hidden}
         if submit:
             payload.update(submit)
 
         try:
-            resp2 = self.session.post(LOGIN_URL, data=payload, timeout=20,
-                                      allow_redirects=True)
-            resp2.raise_for_status()
+            r2 = self.session.post(LOGIN_URL, data=payload, timeout=20)
+            r2.raise_for_status()
         except requests.RequestException as e:
             logger.error("Login POST error: %s", e)
             return False
 
-        if "login" in resp2.url.lower() and self._page_has_error(resp2.text):
-            logger.warning("Login rejected: bad credentials")
+        if "login" in r2.url.lower() and self._has_error(r2.text):
+            logger.warning("Login rejected")
             return False
 
         self._logged_in = True
         logger.info("Logged in as %s", username)
         return True
 
-    def _discover_login_fields(self, soup: BeautifulSoup):
-        user_field = pass_field = None
+    def _discover_login_fields(self, soup):
+        user_f = pass_f = None
         submit = {}
         for inp in soup.find_all("input"):
-            t = (inp.get("type", "text") or "text").lower()
+            t = (inp.get("type") or "text").lower()
             name = inp.get("name", "")
-            iid = (inp.get("id", "") + inp.get("placeholder", "")).lower()
+            hint = (inp.get("id", "") + inp.get("placeholder", "")).lower()
             if t == "password":
-                pass_field = name
+                pass_f = name
             elif t in ("text", "email") and any(
-                k in iid for k in ("user", "login", "nif", "dni", "usuario", "email", "correo")
+                k in hint for k in ("user", "nif", "dni", "usuario", "email", "correo", "login")
             ):
-                user_field = name
+                user_f = name
             elif t == "submit":
                 submit = {name: inp.get("value", "")}
-        if not user_field:
+        if not user_f:
             for inp in soup.find_all("input", {"type": ["text", "email"]}):
                 n = inp.get("name", "")
                 if n and not n.startswith("__"):
-                    user_field = n
+                    user_f = n
                     break
-        return user_field, pass_field, submit
+        return user_f, pass_f, submit
 
-    def _page_has_error(self, html: str) -> bool:
-        return any(k in html.lower() for k in (
+    def _has_error(self, html: str) -> bool:
+        lower = html.lower()
+        return any(k in lower for k in (
             "contraseña incorrecta", "usuario incorrecto", "credenciales",
-            "invalid", "no válido", "acceso denegado", "error"
+            "invalid", "no válido", "acceso denegado",
         ))
 
-    # ── Search available slots ────────────────────────────────────────────────
+    # ── Search ────────────────────────────────────────────────────────────────
 
-    def search_available_slots(self, filters: dict) -> list[Slot]:
+    def search_slots(self, filters: dict) -> list[Slot]:
         """
-        filters keys (all optional):
-          compania, especialidad, medico, centro, provincia, localidad,
-          fecha_desde (dd/MM/yyyy), hora_desde (HH:MM), hora_hasta (HH:MM)
+        filters keys:
+          compania, especialidad, medico,
+          centro (default 30061), provincia (default 0033),
+          localidad (default '0447   '),
+          fecha_desde (dd/MM/yyyy, default today),
+          hora_desde (default 08:00), hora_hasta (default 20:30)
         """
         if not self._logged_in:
             raise RuntimeError("Not logged in")
 
-        compania    = filters.get("compania", "")
+        compania     = filters.get("compania", "")
         especialidad = filters.get("especialidad", "")
-        medico      = filters.get("medico", "")
-        centro      = filters.get("centro", "30061")
-        provincia   = filters.get("provincia", "0033")
-        localidad   = filters.get("localidad", "0447   ")
-        fecha       = filters.get("fecha_desde", date.today().strftime("%d/%m/%Y"))
-        hora_desde  = filters.get("hora_desde", "08:00")
-        hora_hasta  = filters.get("hora_hasta", "20:30")
+        medico       = filters.get("medico", "")
+        centro       = filters.get("centro", "30061")
+        provincia    = filters.get("provincia", "0033")
+        localidad    = filters.get("localidad", "0447   ")
+        fecha        = filters.get("fecha_desde", date.today().strftime("%d/%m/%Y"))
+        hora_desde   = filters.get("hora_desde", "08:00")
+        hora_hasta   = filters.get("hora_hasta", "20:30")
 
-        # Step 1: GET base page
-        soup, fields = self._get_auto_page()
+        # Step 1: base page
+        soup, fields = self._get_auto()
         if soup is None:
             return []
 
-        # Step 2: cascade ddlCompania if needed
+        # Step 2: cascade compania → reloads especialidades
         if compania:
             fields["ddlCompania"] = compania
             soup, fields = self._postback("ddlCompania", fields)
             if soup is None:
                 return []
 
-        # Step 3: cascade ddlEspecialidad if needed
+        # Step 3: cascade especialidad → reloads ddlMedico
         if especialidad:
             fields["ddlEspecialidad"] = especialidad
             soup, fields = self._postback("ddlEspecialidad", fields)
             if soup is None:
                 return []
 
-        # Step 4: set remaining fields and submit
+        # Step 4: final search POST
         fields.update({
-            "ddlCompania":       compania,
-            "ddlEspecialidad":   especialidad,
-            "ddlMedico":         medico,
-            "ddlCentro":         centro,
-            "ddlProvincia":      provincia,
-            "ddlLocalidad":      localidad,
-            "nuevaCita_Fecha":   fecha,
-            "horapreferente":    hora_desde,
-            "horapreferentehasta": hora_hasta,
-            "ddlAtencion":       fields.get("ddlAtencion", ""),
-            "ddlLanguages":      "es",
-            "nuevaCita_id":      "",
-            "__EVENTTARGET":     "",
-            "__EVENTARGUMENT":   "",
-            "__LASTFOCUS":       "",
-            "btnBuscarCitasLibres": "Buscar citas libres",
+            "ddlCompania":           compania,
+            "ddlEspecialidad":       especialidad,
+            "ddlMedico":             medico,
+            "ddlCentro":             centro,
+            "ddlProvincia":          provincia,
+            "ddlLocalidad":          localidad,
+            "nuevaCita_Fecha":       fecha,
+            "horapreferente":        hora_desde,
+            "horapreferentehasta":   hora_hasta,
+            "ddlAtencion":           fields.get("ddlAtencion", ""),
+            "ddlLanguages":          "es",
+            "nuevaCita_id":          "",
+            "__EVENTTARGET":         "",
+            "__EVENTARGUMENT":       "",
+            "__LASTFOCUS":           "",
+            "btnBuscarCitasLibres":  "Buscar citas libres",
         })
 
         try:
@@ -262,46 +295,43 @@ class MedasturScraper:
             logger.error("Search POST error: %s", e)
             return []
 
-        return self._parse_results(resp.text)
+        slots = self._parse_results(resp.text)
+        logger.info("Found %d slots", len(slots))
+        return slots
 
-    def _get_auto_page(self) -> tuple:
+    def _get_auto(self):
         try:
             resp = self.session.get(AUTO_URL, timeout=20)
             resp.raise_for_status()
         except requests.RequestException as e:
-            logger.error("Error fetching autoservicio: %s", e)
+            logger.error("GET autoservicio error: %s", e)
             return None, {}
         soup = BeautifulSoup(resp.text, "html.parser")
         return soup, self._form_state(soup)
 
-    def _postback(self, target: str, fields: dict) -> tuple:
+    def _postback(self, target: str, fields: dict):
         payload = {**fields, "__EVENTTARGET": target, "__EVENTARGUMENT": ""}
         try:
             resp = self.session.post(AUTO_URL, data=payload, timeout=20)
             resp.raise_for_status()
         except requests.RequestException as e:
-            logger.error("PostBack error for %s: %s", target, e)
+            logger.error("PostBack %s error: %s", target, e)
             return None, fields
         soup = BeautifulSoup(resp.text, "html.parser")
-        new_fields = self._form_state(soup)
-        # carry over values that weren't reset
+        new = self._form_state(soup)
         for k, v in fields.items():
-            if k not in new_fields:
-                new_fields[k] = v
-        return soup, new_fields
+            new.setdefault(k, v)
+        return soup, new
 
     def _form_state(self, soup: BeautifulSoup) -> dict:
-        """Extract all hidden fields + current dropdown selected values."""
         state = self._aspnet_fields(soup)
         for sel in soup.find_all("select"):
             name = sel.get("name", "")
             if name:
-                selected = sel.find("option", selected=True)
-                state[name] = selected["value"] if selected else (
-                    sel.find("option")["value"] if sel.find("option") else ""
-                )
+                opt = sel.find("option", selected=True) or sel.find("option")
+                state[name] = opt["value"] if opt else ""
         for inp in soup.find_all("input"):
-            if inp.get("type", "").lower() not in ("hidden", "submit", "button"):
+            if (inp.get("type") or "").lower() not in ("hidden", "submit", "button", "image"):
                 name = inp.get("name", "")
                 if name:
                     state[name] = inp.get("value", "")
@@ -316,123 +346,96 @@ class MedasturScraper:
                 fields[name] = tag.get("value", "")
         return fields
 
-    # ── Parse results ─────────────────────────────────────────────────────────
+    # ── Parse result cards ────────────────────────────────────────────────────
 
     def _parse_results(self, html: str) -> list[Slot]:
         soup = BeautifulSoup(html, "html.parser")
         slots: list[Slot] = []
 
-        # Look for result rows — typically inside a table or update panel
+        # Strategy 1: find every element whose text contains Spanish date pattern
+        # Cards are typically small divs/li containing center + doctor + date
+        seen_keys: set[str] = set()
+
+        for elem in soup.find_all(["div", "li", "article", "tr"]):
+            text = elem.get_text(separator=" ", strip=True)
+            parsed = parse_spanish_date(text)
+            if not parsed:
+                continue
+
+            # Avoid matching parent containers that include all child cards
+            child_matches = sum(
+                1 for c in elem.find_all(["div", "li", "article"])
+                if parse_spanish_date(c.get_text(separator=" ", strip=True))
+            )
+            if child_matches > 0:
+                continue  # this is a container, skip
+
+            dt, hora, fecha_text = parsed
+
+            # Extract doctor and center from the same card text
+            doctor = self._extract_doctor(text)
+            centro = self._extract_centro(text)
+
+            slot = Slot(fecha_dt=dt, hora=hora, doctor=doctor,
+                        centro=centro, fecha_text=fecha_text)
+            if slot.key() not in seen_keys:
+                seen_keys.add(slot.key())
+                slots.append(slot)
+
+        if slots:
+            return sorted(slots, key=lambda s: (s.fecha_dt, s.hora))
+
+        # Strategy 2: table rows (fallback)
         for table in soup.find_all("table"):
             rows = table.find_all("tr")
             if len(rows) < 2:
                 continue
             headers = [th.get_text(strip=True).lower()
                        for th in rows[0].find_all(["th", "td"])]
-            # Must have at least a date/hora column
             if not any(k in " ".join(headers) for k in ("fecha", "hora", "día")):
                 continue
-            col = self._map_cols(headers)
             for row in rows[1:]:
                 cells = [td.get_text(strip=True) for td in row.find_all("td")]
-                if not cells or all(c == "" for c in cells):
-                    continue
-                slot = self._cells_to_slot(cells, col)
-                if slot:
-                    slots.append(slot)
+                text = " ".join(cells)
+                parsed = parse_spanish_date(text)
+                if parsed:
+                    dt, hora, fecha_text = parsed
+                    slot = Slot(fecha_dt=dt, hora=hora,
+                                doctor=self._extract_doctor(text),
+                                centro=self._extract_centro(text),
+                                fecha_text=fecha_text)
+                    if slot.key() not in seen_keys:
+                        seen_keys.add(slot.key())
+                        slots.append(slot)
             if slots:
-                return slots
+                return sorted(slots, key=lambda s: (s.fecha_dt, s.hora))
 
-        # Fallback: look for div-based result cards
-        for card in soup.find_all("div", class_=re.compile(r"cita|slot|result|disp", re.I)):
-            text = card.get_text(separator=" ", strip=True)
-            slot = self._text_to_slot(text)
-            if slot:
-                slots.append(slot)
-
-        # Detect "no results" message
+        # Detect explicit "no results" message
         page_text = soup.get_text(strip=True).lower()
-        no_results_keywords = (
-            "no hay citas", "no existen citas", "no se han encontrado",
-            "sin disponibilidad", "no disponible", "no hay disponibilidad",
-        )
-        if any(k in page_text for k in no_results_keywords):
-            logger.info("No available slots found (explicit message)")
+        no_result_kw = ("no hay citas", "no existen citas", "no se han encontrado",
+                        "sin disponibilidad", "no hay disponibilidad",
+                        "debe buscar la disponibilidad")
+        if any(k in page_text for k in no_result_kw):
             return []
 
-        if slots:
-            return slots
-
-        logger.debug("Could not parse results; raw snippet: %s", html[:500])
+        logger.debug("Could not parse results page. Snippet:\n%s", html[:800])
         return []
 
-    def _map_cols(self, headers: list[str]) -> dict[str, int]:
-        m: dict[str, int] = {}
-        for i, h in enumerate(headers):
-            if any(k in h for k in ("fecha", "día", "day")):
-                m.setdefault("fecha", i)
-            elif any(k in h for k in ("hora", "time", "horario")):
-                m.setdefault("hora", i)
-            elif any(k in h for k in ("médico", "doctor", "facultativo", "profesional")):
-                m.setdefault("doctor", i)
-            elif any(k in h for k in ("consulta", "sala", "room")):
-                m.setdefault("consulta", i)
-            elif any(k in h for k in ("centro", "lugar", "ubicación")):
-                m.setdefault("centro", i)
-        return m
+    def _extract_doctor(self, text: str) -> str:
+        # Doctor names are typically ALL CAPS "APELLIDO, NOMBRE" before the date
+        # Remove the date portion and look for capitalised words
+        text_clean = _DATE_RE.sub("", text)
+        # Remove center keywords
+        text_clean = re.sub(r"centro\s+médico\s+\w+", "", text_clean, flags=re.I)
+        # Find all-caps multi-word sequences (doctor names)
+        m = re.search(r"[A-ZÁÉÍÓÚÜÑ]{2,}[\s,]+[A-ZÁÉÍÓÚÜÑ]{2,}(?:[\s,]+[A-ZÁÉÍÓÚÜÑ]{2,})?", text_clean)
+        return m.group().strip(" ,") if m else ""
 
-    def _cells_to_slot(self, cells: list[str], col: dict[str, int]) -> "Slot | None":
-        def get(key: str) -> str:
-            idx = col.get(key)
-            return cells[idx].strip() if idx is not None and idx < len(cells) else ""
-        fecha = get("fecha")
-        hora  = get("hora")
-        if not fecha and not hora:
-            return None
-        # Try to split combined "fecha hora" cell
-        if fecha and not hora:
-            m = re.search(r"(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\s+(\d{1,2}:\d{2})", fecha)
-            if m:
-                fecha, hora = m.group(1), m.group(2)
-        return Slot(fecha=fecha, hora=hora,
-                    doctor=get("doctor"), consulta=get("consulta"), centro=get("centro"))
-
-    def _text_to_slot(self, text: str) -> "Slot | None":
-        date_m = re.search(r"\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}", text)
-        time_m = re.search(r"\d{1,2}:\d{2}", text)
-        if not date_m:
-            return None
-        return Slot(fecha=date_m.group(), hora=time_m.group() if time_m else "",
-                    doctor="", consulta="", centro="")
+    def _extract_centro(self, text: str) -> str:
+        m = re.search(r"CENTRO\s+MÉDICO\s+\w+|CLINICA\s+\w+|HOSPITAL\s+\w+", text, re.I)
+        return m.group().strip() if m else ""
 
     # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def get_especialidades_from_page(self) -> dict[str, str]:
-        """Returns {value: label} dict of available specialties."""
-        soup, _ = self._get_auto_page()
-        if soup is None:
-            return ESPECIALIDADES_DEFAULT
-        sel = soup.find("select", {"name": "ddlEspecialidad"})
-        if not sel:
-            return ESPECIALIDADES_DEFAULT
-        return {o["value"]: o.get_text(strip=True)
-                for o in sel.find_all("option") if o.get_text(strip=True)}
-
-    def get_medicos(self, compania: str, especialidad: str) -> dict[str, str]:
-        """Returns {value: label} dict of available doctors for given filters."""
-        _, fields = self._get_auto_page()
-        if compania:
-            fields["ddlCompania"] = compania
-            _, fields = self._postback("ddlCompania", fields)
-        if especialidad:
-            fields["ddlEspecialidad"] = especialidad
-            soup, fields = self._postback("ddlEspecialidad", fields)
-            if soup:
-                sel = soup.find("select", {"name": "ddlMedico"})
-                if sel:
-                    return {o["value"]: o.get_text(strip=True)
-                            for o in sel.find_all("option") if o.get_text(strip=True)}
-        return {"": "- Cualquier médico -"}
 
     def logout(self) -> None:
         try:
