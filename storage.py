@@ -1,4 +1,4 @@
-"""Encrypted credential and state storage using JSON files."""
+"""Encrypted credential and state storage."""
 import json
 import os
 from pathlib import Path
@@ -11,8 +11,9 @@ DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 CREDS_FILE = DATA_DIR / "credentials.json"
-STATE_FILE = DATA_DIR / "state.json"
+STATE_FILE = DATA_DIR / "slots.json"
 USERS_FILE = DATA_DIR / "users.json"
+
 
 def _get_fernet() -> Fernet:
     key = os.getenv("ENCRYPTION_KEY")
@@ -26,69 +27,62 @@ def _get_fernet() -> Fernet:
 
 def save_credentials(telegram_id: int, username: str, password: str) -> None:
     fernet = _get_fernet()
-    data = _load_json(CREDS_FILE)
+    data = _load(CREDS_FILE)
     data[str(telegram_id)] = {
         "username": fernet.encrypt(username.encode()).decode(),
         "password": fernet.encrypt(password.encode()).decode(),
     }
-    _save_json(CREDS_FILE, data)
+    _save(CREDS_FILE, data)
 
 
 def load_credentials(telegram_id: int) -> tuple[str, str] | None:
-    data = _load_json(CREDS_FILE)
+    data = _load(CREDS_FILE)
     entry = data.get(str(telegram_id))
     if not entry:
         return None
     fernet = _get_fernet()
-    username = fernet.decrypt(entry["username"].encode()).decode()
-    password = fernet.decrypt(entry["password"].encode()).decode()
-    return username, password
+    return (fernet.decrypt(entry["username"].encode()).decode(),
+            fernet.decrypt(entry["password"].encode()).decode())
 
 
 def delete_credentials(telegram_id: int) -> None:
-    data = _load_json(CREDS_FILE)
+    data = _load(CREDS_FILE)
     data.pop(str(telegram_id), None)
-    _save_json(CREDS_FILE, data)
+    _save(CREDS_FILE, data)
 
 
-def save_user_config(telegram_id: int, config: dict) -> None:
-    data = _load_json(USERS_FILE)
-    data.setdefault(str(telegram_id), {}).update(config)
-    _save_json(USERS_FILE, data)
+def save_user_config(telegram_id: int, update: dict) -> None:
+    data = _load(USERS_FILE)
+    data.setdefault(str(telegram_id), {}).update(update)
+    _save(USERS_FILE, data)
 
 
 def load_user_config(telegram_id: int) -> dict:
-    data = _load_json(USERS_FILE)
-    return data.get(str(telegram_id), {})
+    return _load(USERS_FILE).get(str(telegram_id), {})
 
 
 def get_all_monitoring_users() -> list[int]:
-    data = _load_json(USERS_FILE)
-    return [
-        int(uid)
-        for uid, cfg in data.items()
-        if cfg.get("monitoring", False)
-    ]
+    return [int(uid) for uid, cfg in _load(USERS_FILE).items()
+            if cfg.get("monitoring")]
 
 
-def save_known_appointments(telegram_id: int, appointments: list[dict]) -> None:
-    data = _load_json(STATE_FILE)
-    data[str(telegram_id)] = appointments
-    _save_json(STATE_FILE, data)
+def save_known_slots(telegram_id: int, slots: list[dict]) -> None:
+    data = _load(STATE_FILE)
+    data[str(telegram_id)] = slots
+    _save(STATE_FILE, data)
 
 
-def load_known_appointments(telegram_id: int) -> list[dict]:
-    data = _load_json(STATE_FILE)
-    return data.get(str(telegram_id), [])
+def load_known_slots(telegram_id: int) -> list[dict]:
+    return _load(STATE_FILE).get(str(telegram_id), [])
 
 
-def _load_json(path: Path) -> dict:
+def _load(path: Path) -> dict:
     if path.exists():
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 
-def _save_json(path: Path, data: dict) -> None:
+def _save(path: Path, data: dict) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
