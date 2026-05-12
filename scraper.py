@@ -267,6 +267,18 @@ class MedasturScraper:
             soup, fields = self._postback("ddlEspecialidad", fields)
             if soup is None:
                 return []
+            # Pick "CUALQUIER MÉDICO" from the reloaded ddlMedico dropdown
+            if not medico and soup:
+                medico_sel = soup.find("select", {"name": "ddlMedico"})
+                if medico_sel:
+                    cualquier = next(
+                        (o for o in medico_sel.find_all("option")
+                         if "cualquier" in o.get_text(strip=True).lower()),
+                        None,
+                    )
+                    if cualquier:
+                        medico = cualquier.get("value", "")
+                        logger.info("ddlMedico → CUALQUIER MÉDICO (%r)", medico)
 
         # Step 4: final search POST
         fields.update({
