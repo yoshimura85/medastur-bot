@@ -300,10 +300,10 @@ class MedasturScraper:
         fields["horapreferentehasta"] = hora_hasta
         fields["ddlLanguages"]        = "es"
         fields["nuevaCita_id"]        = ""
-        fields["__EVENTTARGET"]       = ""
+        fields["__EVENTTARGET"]       = "btnBuscarCitasLibres"
         fields["__EVENTARGUMENT"]     = ""
         fields["__LASTFOCUS"]         = ""
-        fields["btnBuscarCitasLibres"] = "Buscar citas libres"
+        fields.pop("btnBuscarCitasLibres", None)  # button uses __doPostBack, not submit value
         logger.info("Search POST fields subset: compania=%r esp=%r medico=%r centro=%r",
                     compania, especialidad, medico, fields.get("ddlCentro"))
 
